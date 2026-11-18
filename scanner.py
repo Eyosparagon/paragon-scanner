@@ -8,7 +8,7 @@ Keys come from the environment (GitHub "Secrets"), never from this file:
   OANDA_TOKEN, WHATABOT_KEY, WHATSAPP_PHONE
 Run with --dry-run to print what it finds without sending anything.
 """
-import base64, io, json, os, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, io, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OANDA = "https://api-fxpractice.oanda.com"
@@ -32,8 +32,15 @@ def fetch_candles(symbol, seconds, token, count=4000):
                                     "alignmentTimezone": "UTC", "weeklyAlignment": "Monday"})
     request = urllib.request.Request(f"{OANDA}/v3/instruments/{symbol}/candles?{query}",
                                      headers={"Authorization": "Bearer " + token, "Accept-Datetime-Format": "UNIX", "User-Agent": AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        rows = json.load(response).get("candles", [])
+    for attempt in range(3):                                # OANDA now and then refuses a request; try again
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                rows = json.load(response).get("candles", [])
+            break
+        except urllib.error.HTTPError:
+            if attempt == 2:
+                raise
+            time.sleep(1.5)
     out = []
     for row in rows:
         mid = row.get("mid")
@@ -220,13 +227,15 @@ def whatabot(path, body):
     LAST_SEND[0] = time.time()
     key, phone = os.environ["WHATABOT_KEY"], "".join(ch for ch in os.environ["WHATSAPP_PHONE"] if ch.isdigit())
     body.update({"ApiKey": key, "Phone": phone})
-    request = urllib.request.Request("https://api.whatabot.io/Whatsapp/" + path, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json", "x-api-key": key, "User-Agent": "curl/8.4.0", "Accept": "*/*"})
+    # sent with curl: Whatabot's firewall turns away Python's own web client
     try:
-        with urllib.request.urlopen(request, timeout=40) as response:
-            return response.status == 200
-    except urllib.error.HTTPError as error:
-        print("  whatsapp refused:", error.code)
+        done = subprocess.run(["curl", "-s", "-m", "40", "-w", "\n%{http_code}", "-X", "POST", "https://api.whatabot.io/Whatsapp/" + path,
+                               "-H", "Content-Type: application/json", "-H", "x-api-key: " + key, "--data-binary", "@-"],
+                              input=json.dumps(body), capture_output=True, text=True)
+        answer, _, code = done.stdout.rpartition("\n")
+        if code.strip() == "200":
+            return True
+        print("  whatsapp refused:", code.strip(), answer.replace(key, "<key>")[:120].replace("\n", " "))
         return False
     except Exception as error:                              # a failed alert must not stop the scan
         print("  whatsapp failed:", type(error).__name__)
