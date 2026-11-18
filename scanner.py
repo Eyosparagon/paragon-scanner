@@ -209,7 +209,15 @@ def grade(setup):
     return "A+ setup" if setup["aplus"] else "A setup" if setup["with_trend"] else "Counter-trend setup"
 
 
+LAST_SEND = [0.0]
+
+
 def whatabot(path, body):
+    # Whatabot accepts one message every 5 seconds; anything sooner is dropped
+    wait = LAST_SEND[0] + 5.5 - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    LAST_SEND[0] = time.time()
     key, phone = os.environ["WHATABOT_KEY"], "".join(ch for ch in os.environ["WHATSAPP_PHONE"] if ch.isdigit())
     body.update({"ApiKey": key, "Phone": phone})
     request = urllib.request.Request("https://api.whatabot.io/Whatsapp/" + path, data=json.dumps(body).encode(),
@@ -270,6 +278,21 @@ def picture(candles, setup, symbol, timeframe):
     return data.getvalue()
 
 
+def save_chart(jpeg, name):
+    """Keeps the picture in the repository's charts folder and returns the link it will have once the run has saved it."""
+    folder = os.path.join(HERE, "charts")
+    os.makedirs(folder, exist_ok=True)
+    today = time.strftime("%Y%m%d", time.gmtime())
+    for old in os.listdir(folder):                          # pictures older than a week are removed
+        if old[:8].isdigit() and int(today) - int(old[:8]) > 7 and old.endswith(".jpg"):
+            os.remove(os.path.join(folder, old))
+    file = f"{today}-{name}.jpg"
+    with open(os.path.join(folder, file), "wb") as out:
+        out.write(jpeg)
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    return f"https://raw.githubusercontent.com/{repo}/main/charts/{file}" if repo else None
+
+
 def main():
     dry = "--dry-run" in sys.argv
     config = json.load(open(os.path.join(HERE, "config.json")))
@@ -285,6 +308,7 @@ def main():
     now = int(time.time())
     sent = {k: v for k, v in sent.items() if now - v < 14 * 86400}
 
+    tested = False
     for symbol in config["watchlist"]:
         name = oanda_symbol(symbol)
         if not name:
@@ -304,6 +328,11 @@ def main():
                 side = "long" if s["direction"] == 1 else "short"
                 print(f"{symbol} {timeframe} {side} {s['stage']} {'A+' if s['aplus'] else 'A' if s['with_trend'] else 'counter-trend'} "
                       f"entry {price_text(s['entry'], symbol)} {s['rr']:.1f}R")
+                if "--test" in sys.argv and can_send and not tested:        # one chart link for the first setup found, whatever its grade
+                    tested = True
+                    jpeg = picture(closed, s, symbol, timeframe)
+                    link = save_chart(jpeg, f"{symbol}-{timeframe}-{s['time']}-test") if jpeg else None
+                    whatabot("RequestSendMessage", {"Text": f"Test from the cloud: {symbol} {timeframe} chart: {link}"})
                 if s["stage"] == "forming" or not wanted(s, config):
                     continue
                 gap = (s["entry"] - live) * -s["direction"]
@@ -325,9 +354,9 @@ def main():
                         sent[base + "|" + tag] = now
                         if config.get("send_picture", True):
                             jpeg = picture(closed, s, symbol, timeframe)
-                            if jpeg:
-                                time.sleep(2)
-                                whatabot("SendImage", {"Base64Image": base64.b64encode(jpeg).decode()})
+                            link = save_chart(jpeg, f"{symbol}-{timeframe}-{s['time']}-{tag}") if jpeg else None
+                            if link:                        # Whatabot does not deliver pictures, so the alert carries a link to it
+                                whatabot("RequestSendMessage", {"Text": "Chart: " + link})
                     elif dry:
                         sent.setdefault(base + "|" + tag, now) if "--remember" in sys.argv else None
             time.sleep(0.2)
