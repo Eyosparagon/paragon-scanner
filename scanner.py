@@ -234,8 +234,9 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
        Within the leg that made that break, every push is a candidate; a push inside the leg must be strong (three typical candles).
     2. The breaking push must leave a fair value gap.
     3. Order block: the last opposite candle right before a push. Of the untouched ones, the block with the strongest push wins.
-       A+ needs that push to be massive (three typical candles within six), the higher timeframe to agree, the move to have
-       started by sweeping an earlier untouched swing, and the push to have begun in the London or New York session.
+       A+ needs that push to be massive (three typical candles within six), the higher timeframe to agree, and the move to
+       have started by sweeping an earlier untouched swing.
+    8. Entry is a limit order, unless price is coming at the block with momentum: then wait for a rejection there first.
     4. Mitigation: an order block price has touched since the break is used up.
     5. Liquidity: at least one internal swing must have formed after the break, between price and the block (a range is better).
     6. Entry is a limit at the block's body edge, stop beyond its wick, target the weak high or low the push left.
@@ -321,18 +322,18 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             swept = any(w["is_high"] == (d == -1) and ob - 80 <= w["index"] <= ob - 3 and (tip - w["price"]) * -d > 0
                         and all((k["high"] <= w["price"]) if d == -1 else (k["low"] >= w["price"]) for k in c[w["index"] + 1:max(ob - 2, 0)])
                         for w in inner["swings"])
-            hour = time.gmtime(c[start]["time"]).tm_hour
-            session = "London" if 6 <= hour < 10 else "New York" if 12 <= hour < 16 else ""
+            # is price coming at the block fast? then a limit order is not enough: wait for it to be rejected first
+            fast = (last["close"] - c[newest - 3]["close"]) * -d >= typical * 2.5 or (last["close"] - last["open"]) * -d >= typical * 1.5
             if best is not None and push <= best["push"]:
                 continue                                    # a stronger push has already been found in this leg
             best = {"direction": d, "stage": "at_block" if touched_now else "ready", "entry": entry, "stop": stop, "target": target, "rr": rr,
                     "time": c[ob]["time"], "block_top": c[ob]["high"], "block_bottom": c[ob]["low"], "poi": "OB",
                     "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
                     "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
-                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push, "swept": swept, "session": session,
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push, "swept": swept, "fast": fast,
                     "fvg_time": c[gap - 1]["time"], "fvg_bottom": fvg[0], "fvg_top": fvg[1],
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
-                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15 and swept and bool(session)}
+                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15 and swept}
         if best:
             out.append(best)
     return out
@@ -498,7 +499,7 @@ def picture(candles, setup, symbol, timeframe):
         draw.text((right + 4, y(price) - 7), f"{name} {price_text(price, symbol)}", fill=(255, 255, 255), font=small)
     label = "A+" if setup["aplus"] else "A" if setup["with_trend"] else "counter-trend"
     draw.text((left + 2, 10), f"{symbol}  {timeframe}  ·  {'Long' if setup['direction'] == 1 else 'Short'}  ·  {label}  ·  {setup['rr']:.1f}R", fill=(214, 218, 225), font=big)
-    notes = [setup.get("trigger", "")] + (["swept liquidity"] if setup.get("swept") else []) + ([setup["session"] + " session"] if setup.get("session") else [])
+    notes = [setup.get("trigger", "")] + (["swept liquidity"] if setup.get("swept") else []) + (["CONFIRMED"] if setup.get("confirmed") else [])
     draw.text((left + 2, 36), "  ·  ".join([n for n in notes if n] + ["a pattern, not a prediction"]), fill=(125, 133, 144), font=small)
     data = io.BytesIO()
     image.save(data, format="JPEG", quality=85)
@@ -570,6 +571,16 @@ def main():
                 continue
             live = candles[-1]["close"]
             trend = bigger_trend(closed, seconds)
+            pending = sent.setdefault("_pending", {})
+            for p, k in confirmations(pending, closed, f"{symbol}|{timeframe}"):
+                risk = abs(p["stop"] - k["close"])
+                rr = abs(k["close"] - p["target"]) / risk if risk > 0 else 0
+                text = (f"CONFIRMED: {symbol} {timeframe} {side_of(p)}. Price was rejected at the order block: a candle closed back "
+                        f"{'below' if p['direction'] == -1 else 'above'} the one before it. Now {price_text(k['close'], symbol)}, "
+                        f"stop {price_text(p['stop'], symbol)}, target {price_text(p['target'], symbol)} ({rr:.1f}R from here).")
+                print("  ALERT:", text)
+                if can_send:
+                    notify(text, picture(closed, dict(p, confirmed=True), symbol, timeframe) if config.get("send_picture", True) else None, "confirmed")
             # the stricter method decides what can be A+; the earlier rules still stand, graded A at most
             found = find_setups_v2(closed[-800:], config.get("min_rr", 3.5), seconds, history=closed)
             for old in find_setups(closed[-800:], config.get("min_rr", 3.5), trend):
@@ -601,10 +612,14 @@ def main():
                 for tag, place in events:
                     if base + "|" + tag in sent:
                         continue
-                    tags = [s["trigger"]] + (["swept liquidity"] if s.get("swept") else []) + ([s["session"] + " session"] if s.get("session") else []) if "trigger" in s else []
+                    tags = [s["trigger"]] + (["swept liquidity"] if s.get("swept") else []) if "trigger" in s else []
                     how = f" [{', '.join(tags)}]" if tags else ""
                     text = (f"{grade(s)}: {symbol} {timeframe} {side}{how}, {place}. Entry {price_text(s['entry'], symbol)}, "
                             f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")
+                    if s.get("fast") and tag in ("near", "at"):
+                        text += " Price is arriving fast: wait for a rejection at the block before entering; a CONFIRMED alert follows if it comes."
+                        if tag == "at":
+                            pending[f"{symbol}|{timeframe}|{s['direction']}|{s['time']}"] = dict(s, touch=closed[-1]["time"])
                     print("  ALERT:", text)
                     jpeg = picture(closed, s, symbol, timeframe) if config.get("send_picture", True) else None
                     if can_send and notify(text, jpeg, f"{symbol}-{timeframe}-{s['time']}-{tag}"):
@@ -615,6 +630,30 @@ def main():
     if not dry or "--remember" in sys.argv:
         json.dump(sent, open(state_path, "w"))
     print("done:", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()))
+
+
+def confirmations(pending, closed, key):
+    """Setups price reached with momentum: look for the rejection. Returns (setup, candle) pairs that are now confirmed, and
+    drops the ones that failed (closed beyond the stop) or went stale (twelve candles with no rejection)."""
+    out = []
+    for name in [n for n in pending if n.startswith(key + "|")]:
+        p = pending[name]
+        d, first = p["direction"], next((i for i, k in enumerate(closed) if k["time"] > p["touch"]), None)
+        if first is None or first == 0:
+            continue
+        done = False
+        for j in range(first, len(closed)):
+            k, prev = closed[j], closed[j - 1]
+            if (k["close"] - p["stop"]) * d <= 0 or j - first >= 12:
+                done = True                                 # stopped out, or nothing happened
+                break
+            if (k["close"] < prev["low"]) if d == -1 else (k["close"] > prev["high"]):
+                out.append((p, k))                          # a candle closed back through the one before it: rejected
+                done = True
+                break
+        if done:
+            del pending[name]
+    return out
 
 
 def run():
