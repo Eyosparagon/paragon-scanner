@@ -5,7 +5,7 @@ as the Mac app's scanner, and sends a WhatsApp alert through Whatabot. It only R
 messages: there is no code here that can place an order.
 
 Keys come from the environment (GitHub "Secrets"), never from this file:
-  OANDA_TOKEN, WHATABOT_KEY, WHATSAPP_PHONE
+  OANDA_TOKEN, and TELEGRAM_TOKEN + TELEGRAM_CHAT (or WHATABOT_KEY + WHATSAPP_PHONE for WhatsApp)
 Run with --dry-run to print what it finds without sending anything.
 """
 import base64, io, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -212,6 +212,10 @@ def wanted(setup, config):
     return side == "both" or (side == "long") == (setup["direction"] == 1)
 
 
+def side_of(setup):
+    return "long" if setup["direction"] == 1 else "short"
+
+
 def grade(setup):
     return "A+ setup" if setup["aplus"] else "A setup" if setup["with_trend"] else "Counter-trend setup"
 
@@ -240,6 +244,32 @@ def whatabot(path, body):
     except Exception as error:                              # a failed alert must not stop the scan
         print("  whatsapp failed:", type(error).__name__)
         return False
+
+
+def telegram(text, jpeg=None):
+    """One Telegram message: the chart with the alert as its caption, or just the text when there is no picture."""
+    token, chat = os.environ["TELEGRAM_TOKEN"].strip(), os.environ["TELEGRAM_CHAT"].strip()
+    command = ["curl", "-s", "-m", "40", "-w", "\n%{http_code}", "--form-string", "chat_id=" + chat]
+    path = os.path.join(HERE, "alert.jpg")
+    if jpeg:
+        with open(path, "wb") as out:
+            out.write(jpeg)
+        command += ["--form-string", "caption=" + text, "-F", "photo=@" + path, f"https://api.telegram.org/bot{token}/sendPhoto"]
+    else:
+        command += ["--form-string", "text=" + text, f"https://api.telegram.org/bot{token}/sendMessage"]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True)
+        answer, _, code = done.stdout.rpartition("\n")
+        if code.strip() == "200":
+            return True
+        print("  telegram refused:", code.strip(), answer.replace(token, "<token>")[:160])
+        return False
+    except Exception as error:                              # a failed alert must not stop the scan
+        print("  telegram failed:", type(error).__name__)
+        return False
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def picture(candles, setup, symbol, timeframe):
@@ -308,7 +338,20 @@ def main():
     token = os.environ.get("OANDA_TOKEN", "")
     if not token:
         sys.exit("OANDA_TOKEN is not set.")
-    can_send = not dry and os.environ.get("WHATABOT_KEY") and os.environ.get("WHATSAPP_PHONE")
+    use_telegram = bool(os.environ.get("TELEGRAM_TOKEN") and os.environ.get("TELEGRAM_CHAT"))
+    can_send = not dry and (use_telegram or (os.environ.get("WHATABOT_KEY") and os.environ.get("WHATSAPP_PHONE")))
+
+    def notify(text, jpeg, name):
+        """Telegram carries the picture itself; WhatsApp (Whatabot) gets the text and a link to the picture."""
+        if use_telegram:
+            return telegram(text, jpeg)
+        if not whatabot("RequestSendMessage", {"Text": text[:200]}):
+            return False
+        link = save_chart(jpeg, name) if jpeg else None
+        if link:
+            whatabot("RequestSendMessage", {"Text": "Chart: " + link})
+        return True
+
     state_path = os.path.join(HERE, "state.json")
     try:
         sent = json.load(open(state_path))
@@ -339,9 +382,9 @@ def main():
                       f"entry {price_text(s['entry'], symbol)} {s['rr']:.1f}R")
                 if "--test" in sys.argv and can_send and not tested:        # one chart link for the first setup found, whatever its grade
                     tested = True
-                    jpeg = picture(closed, s, symbol, timeframe)
-                    link = save_chart(jpeg, f"{symbol}-{timeframe}-{s['time']}-test") if jpeg else None
-                    whatabot("RequestSendMessage", {"Text": f"Test from the cloud: {symbol} {timeframe} chart: {link}"})
+                    notify(f"Test from the cloud scanner: {symbol} {timeframe} {side_of(s)}, {s['stage']}. Entry {price_text(s['entry'], symbol)}, "
+                           f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).",
+                           picture(closed, s, symbol, timeframe), f"{symbol}-{timeframe}-{s['time']}-test")
                 if s["stage"] == "forming" or not wanted(s, config):
                     continue
                 gap = (s["entry"] - live) * -s["direction"]
@@ -357,15 +400,11 @@ def main():
                     if base + "|" + tag in sent:
                         continue
                     text = (f"{grade(s)}: {symbol} {timeframe} {side}, {place}. Entry {price_text(s['entry'], symbol)}, "
-                            f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")[:200]
+                            f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")
                     print("  ALERT:", text)
-                    if can_send and whatabot("RequestSendMessage", {"Text": text}):
+                    jpeg = picture(closed, s, symbol, timeframe) if config.get("send_picture", True) else None
+                    if can_send and notify(text, jpeg, f"{symbol}-{timeframe}-{s['time']}-{tag}"):
                         sent[base + "|" + tag] = now
-                        if config.get("send_picture", True):
-                            jpeg = picture(closed, s, symbol, timeframe)
-                            link = save_chart(jpeg, f"{symbol}-{timeframe}-{s['time']}-{tag}") if jpeg else None
-                            if link:                        # Whatabot does not deliver pictures, so the alert carries a link to it
-                                whatabot("RequestSendMessage", {"Text": "Chart: " + link})
                     elif dry:
                         sent.setdefault(base + "|" + tag, now) if "--remember" in sys.argv else None
             time.sleep(0.2)
