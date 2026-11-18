@@ -2,7 +2,7 @@ name: Scan for setups
 
 on:
   schedule:
-    - cron: "*/5 * * * *"      # every 5 minutes (GitHub often runs timers a few minutes late)
+    - cron: "*/15 * * * *"     # a safety net only: restarts the watch if it ever stops
   workflow_dispatch:            # lets you press "Run workflow" to try it by hand
     inputs:
       test:
@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write               # lets the run save chart pictures into the charts folder
+  actions: write                # lets the run start the next one when it ends
 
 concurrency:
   group: scan
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +34,8 @@ jobs:
           path: state.json
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - run: python scanner.py ${{ inputs.test && '--test' || '' }}
+      # watches for about five and a half hours, scanning every 90 seconds
+      - run: python scanner.py --loop 330 ${{ inputs.test && '--test' || '' }}
         env:
           # the secret was saved under the name OANDO_TOKEN, so either spelling is accepted
           OANDA_TOKEN: ${{ secrets.OANDA_TOKEN || secrets.OANDO_TOKEN }}
@@ -53,3 +55,9 @@ jobs:
         with:
           path: state.json
           key: state-${{ github.run_id }}
+      # GitHub's own timer proved unreliable, so each watch starts the next one as it ends
+      - name: Start the next watch
+        if: success() || failure()
+        run: gh workflow run scan.yml --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
