@@ -1,5 +1,5 @@
 {
-  "watchlist": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "GBPJPY", "EURJPY", "AUDJPY", "EURGBP", "AUDNZD", "GOLD"],
+  "watchlist": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "GBPJPY", "EURJPY", "AUDJPY", "EURGBP", "AUDNZD", "GOLD", "GBPCAD", "GBPAUD", "CADJPY", "CHFJPY", "EURCAD", "USDCHF", "NZDJPY"],
   "timeframes": ["15m", "1h"],
   "min_rr": 3.5,
   "quality": "a",
