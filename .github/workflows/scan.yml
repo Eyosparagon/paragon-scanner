@@ -27,7 +27,8 @@ jobs:
           restore-keys: state-
       - run: python scanner.py
         env:
-          OANDA_TOKEN: ${{ secrets.OANDA_TOKEN }}
+          # the secret was saved under the name OANDO_TOKEN, so either spelling is accepted
+          OANDA_TOKEN: ${{ secrets.OANDA_TOKEN || secrets.OANDO_TOKEN }}
           WHATABOT_KEY: ${{ secrets.WHATABOT_KEY }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
       - uses: actions/cache/save@v4
