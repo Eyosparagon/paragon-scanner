@@ -37,6 +37,7 @@ jobs:
       # watches for about five and a half hours, scanning every 90 seconds
       - run: python scanner.py --loop 330 ${{ inputs.test && '--test' || '' }}
         env:
+          PYTHONUNBUFFERED: "1"      # write the log as it goes, so a running watch can be read
           # the secret was saved under the name OANDO_TOKEN, so either spelling is accepted
           OANDA_TOKEN: ${{ secrets.OANDA_TOKEN || secrets.OANDO_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
