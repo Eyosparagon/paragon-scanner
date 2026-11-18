@@ -234,7 +234,8 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
        Within the leg that made that break, every push is a candidate; a push inside the leg must be strong (three typical candles).
     2. The breaking push must leave a fair value gap.
     3. Order block: the last opposite candle right before a push. Of the untouched ones, the block with the strongest push wins.
-       A+ needs that push to be massive (three typical candles within six) and the higher timeframe to agree.
+       A+ needs that push to be massive (three typical candles within six), the higher timeframe to agree, the move to have
+       started by sweeping an earlier untouched swing, and the push to have begun in the London or New York session.
     4. Mitigation: an order block price has touched since the break is used up.
     5. Liquidity: at least one internal swing must have formed after the break, between price and the block (a range is better).
     6. Entry is a limit at the block's body edge, stop beyond its wick, target the weak high or low the push left.
@@ -281,7 +282,10 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             if gap is None:
                 continue                                    # no fair value gap: the push was not impulsive
             fvg = sorted([c[gap - 1]["high"], c[gap + 1]["low"]] if d == 1 else [c[gap + 1]["high"], c[gap - 1]["low"]])
-            entry = c[ob]["open"]                           # the body edge nearest price (a down candle's open, for a long)
+            block = c[ob]
+            body = abs(block["close"] - block["open"])
+            # where to enter: at the body when the candle is mostly wick, from the wick when it is mostly body
+            entry = block["open"] if body < (block["high"] - block["low"]) - body else (block["low"] if d == -1 else block["high"])
             run = c[ob + 1:ob + 7]                          # how far price travelled in the six candles after the block
             push = (entry - min(k["low"] for k in run)) if d == -1 else (max(k["high"] for k in run) - entry)
             if scope == "internal" and push < typical * 3:
@@ -312,16 +316,23 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             touched_now = (last["high"] >= entry) if d == -1 else (last["low"] <= entry)
             taken = (last["high"] >= idm) if d == -1 else (last["low"] <= idm)
             ranging = len(pools) >= 2
+            # did the move start by taking liquidity? the origin must poke beyond an earlier swing nobody had touched since
+            tip = max(k["high"] for k in c[max(ob - 2, 0):start + 1]) if d == -1 else min(k["low"] for k in c[max(ob - 2, 0):start + 1])
+            swept = any(w["is_high"] == (d == -1) and ob - 80 <= w["index"] <= ob - 3 and (tip - w["price"]) * -d > 0
+                        and all((k["high"] <= w["price"]) if d == -1 else (k["low"] >= w["price"]) for k in c[w["index"] + 1:max(ob - 2, 0)])
+                        for w in inner["swings"])
+            hour = time.gmtime(c[start]["time"]).tm_hour
+            session = "London" if 6 <= hour < 10 else "New York" if 12 <= hour < 16 else ""
             if best is not None and push <= best["push"]:
                 continue                                    # a stronger push has already been found in this leg
             best = {"direction": d, "stage": "at_block" if touched_now else "ready", "entry": entry, "stop": stop, "target": target, "rr": rr,
                     "time": c[ob]["time"], "block_top": c[ob]["high"], "block_bottom": c[ob]["low"], "poi": "OB",
                     "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
                     "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
-                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push,
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push, "swept": swept, "session": session,
                     "fvg_time": c[gap - 1]["time"], "fvg_bottom": fvg[0], "fvg_top": fvg[1],
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
-                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15}
+                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15 and swept and bool(session)}
         if best:
             out.append(best)
     return out
@@ -487,7 +498,8 @@ def picture(candles, setup, symbol, timeframe):
         draw.text((right + 4, y(price) - 7), f"{name} {price_text(price, symbol)}", fill=(255, 255, 255), font=small)
     label = "A+" if setup["aplus"] else "A" if setup["with_trend"] else "counter-trend"
     draw.text((left + 2, 10), f"{symbol}  {timeframe}  ·  {'Long' if setup['direction'] == 1 else 'Short'}  ·  {label}  ·  {setup['rr']:.1f}R", fill=(214, 218, 225), font=big)
-    draw.text((left + 2, 36), "PARAGON CHARTS cloud scanner  ·  a pattern, not a prediction", fill=(125, 133, 144), font=small)
+    notes = [setup.get("trigger", "")] + (["swept liquidity"] if setup.get("swept") else []) + ([setup["session"] + " session"] if setup.get("session") else [])
+    draw.text((left + 2, 36), "  ·  ".join([n for n in notes if n] + ["a pattern, not a prediction"]), fill=(125, 133, 144), font=small)
     data = io.BytesIO()
     image.save(data, format="JPEG", quality=85)
     return data.getvalue()
@@ -589,7 +601,8 @@ def main():
                 for tag, place in events:
                     if base + "|" + tag in sent:
                         continue
-                    how = f" [{s['trigger']}, {s['poi']}{', from a higher-timeframe block' if s.get('htf_poi') else ''}]" if "trigger" in s else ""
+                    tags = [s["trigger"]] + (["swept liquidity"] if s.get("swept") else []) + ([s["session"] + " session"] if s.get("session") else []) if "trigger" in s else []
+                    how = f" [{', '.join(tags)}]" if tags else ""
                     text = (f"{grade(s)}: {symbol} {timeframe} {side}{how}, {place}. Entry {price_text(s['entry'], symbol)}, "
                             f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")
                     print("  ALERT:", text)
