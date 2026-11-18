@@ -5,7 +5,7 @@ as the Mac app's scanner, and sends a WhatsApp alert through Whatabot. It only R
 messages: there is no code here that can place an order.
 
 Keys come from the environment (GitHub "Secrets"), never from this file:
-  OANDA_TOKEN, and TELEGRAM_TOKEN + TELEGRAM_CHAT (or WHATABOT_KEY + WHATSAPP_PHONE for WhatsApp)
+  OANDA_TOKEN, and TELEGRAM_TOKEN (or WHATABOT_KEY + WHATSAPP_PHONE for WhatsApp)
 Run with --dry-run to print what it finds without sending anything.
 """
 import base64, io, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -246,9 +246,24 @@ def whatabot(path, body):
         return False
 
 
+CHAT = [None]
+
+
+def find_chat(token):
+    """The chat to send to: whoever last wrote to the bot. Used when no TELEGRAM_CHAT secret is set."""
+    try:
+        done = subprocess.run(["curl", "-s", "-m", "30", f"https://api.telegram.org/bot{token}/getUpdates"], capture_output=True, text=True)
+        chats = [u["message"]["chat"]["id"] for u in json.loads(done.stdout).get("result", []) if "message" in u]
+        return str(chats[-1]) if chats else None
+    except Exception:
+        return None
+
+
 def telegram(text, jpeg=None):
     """One Telegram message: the chart with the alert as its caption, or just the text when there is no picture."""
-    token, chat = os.environ["TELEGRAM_TOKEN"].strip(), os.environ["TELEGRAM_CHAT"].strip()
+    token, chat = os.environ["TELEGRAM_TOKEN"].strip(), CHAT[0]
+    if not chat:
+        return False
     command = ["curl", "-s", "-m", "40", "-w", "\n%{http_code}", "--form-string", "chat_id=" + chat]
     path = os.path.join(HERE, "alert.jpg")
     if jpeg:
@@ -338,7 +353,7 @@ def main():
     token = os.environ.get("OANDA_TOKEN", "")
     if not token:
         sys.exit("OANDA_TOKEN is not set.")
-    use_telegram = bool(os.environ.get("TELEGRAM_TOKEN") and os.environ.get("TELEGRAM_CHAT"))
+    use_telegram = bool(os.environ.get("TELEGRAM_TOKEN"))
     can_send = not dry and (use_telegram or (os.environ.get("WHATABOT_KEY") and os.environ.get("WHATSAPP_PHONE")))
 
     def notify(text, jpeg, name):
@@ -358,7 +373,13 @@ def main():
     except (OSError, ValueError):
         sent = {}
     now = int(time.time())
-    sent = {k: v for k, v in sent.items() if now - v < 14 * 86400}
+    sent = {k: v for k, v in sent.items() if k.startswith("_") or now - v < 14 * 86400}
+    if use_telegram:
+        CHAT[0] = os.environ.get("TELEGRAM_CHAT", "").strip() or sent.get("_chat") or find_chat(os.environ["TELEGRAM_TOKEN"].strip())
+        if CHAT[0]:
+            sent["_chat"] = CHAT[0]                          # remembered, so it keeps working after Telegram forgets the message
+        else:
+            print("Telegram: open your bot in Telegram, press Start or send it any message, then run this again.")
 
     tested = False
     for symbol in config["watchlist"]:
