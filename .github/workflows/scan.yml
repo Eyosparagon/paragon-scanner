@@ -4,6 +4,14 @@ on:
   schedule:
     - cron: "*/5 * * * *"      # every 5 minutes (GitHub often runs timers a few minutes late)
   workflow_dispatch:            # lets you press "Run workflow" to try it by hand
+    inputs:
+      test:
+        description: "Send one test chart link to WhatsApp"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write               # lets the run save chart pictures into the charts folder
 
 concurrency:
   group: scan
@@ -25,12 +33,19 @@ jobs:
           path: state.json
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - run: python scanner.py
+      - run: python scanner.py ${{ inputs.test && '--test' || '' }}
         env:
           # the secret was saved under the name OANDO_TOKEN, so either spelling is accepted
           OANDA_TOKEN: ${{ secrets.OANDA_TOKEN || secrets.OANDO_TOKEN }}
           WHATABOT_KEY: ${{ secrets.WHATABOT_KEY }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+      - name: Save chart pictures
+        if: always()
+        run: |
+          git config user.name "paragon-scanner"
+          git config user.email "scanner@users.noreply.github.com"
+          git add -A charts 2>/dev/null || true
+          git diff --cached --quiet || (git commit -q -m "Chart pictures" && git push -q)
       - uses: actions/cache/save@v4
         if: always()
         with:
