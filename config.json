@@ -1,0 +1,11 @@
+{
+  "watchlist": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "GBPJPY", "EURJPY", "AUDJPY", "EURGBP", "AUDNZD", "GOLD"],
+  "timeframes": ["15m", "1h"],
+  "min_rr": 3.5,
+  "quality": "aplus",
+  "direction": "both",
+  "alert_ready": true,
+  "alert_approaching": true,
+  "alert_at_block": true,
+  "send_picture": true
+}
