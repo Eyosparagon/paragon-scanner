@@ -67,7 +67,7 @@ def regroup(candles, seconds):
 
 def analyze(c, n=3, lookback=6, max_gap_to_break=5):
     count = len(c)
-    out = {"blocks": [], "swings": [], "trend": 0}
+    out = {"blocks": [], "swings": [], "breaks": [], "trend": 0}
     if count <= 2 * n + 5:
         return out
 
@@ -91,11 +91,13 @@ def analyze(c, n=3, lookback=6, max_gap_to_break=5):
                 swing_low = (p, c[p]["low"]); last_low = swing_low
         event = None
         if swing_high is not None and c[t]["close"] > swing_high[1]:
-            event = (swing_high[0], 1); trend = 1; swing_high = None
+            event = (swing_high[0], 1); kind = "MSS" if trend == -1 else "BOS"; trend = 1; swing_high = None
         elif swing_low is not None and c[t]["close"] < swing_low[1]:
-            event = (swing_low[0], -1); trend = -1; swing_low = None
+            event = (swing_low[0], -1); kind = "MSS" if trend == 1 else "BOS"; trend = -1; swing_low = None
         if event is None:
             continue
+        run = out["breaks"][-1]["run"] + 1 if out["breaks"] and out["breaks"][-1]["direction"] == event[1] else 1
+        out["breaks"].append({"index": t, "level_index": event[0], "direction": event[1], "kind": kind, "run": run})
         level_index, d = event
         leg = level_index                                   # origin of the move that broke structure
         for i in range(level_index, t + 1):
@@ -186,10 +188,129 @@ def find_setups(c, min_rr, higher_trend=0, max_age=150):
             middle = (range_high + range_low) / 2
             right_half = range_high > range_low and (entry >= middle if d == -1 else entry <= middle)
             found = {"direction": d, "stage": stage, "entry": entry, "stop": stop, "target": target, "rr": rr, "time": c[b["index"]]["time"],
+                     "block_top": b["top"], "block_bottom": b["bottom"],
                      "with_trend": higher_trend == d, "typical": typical,
                      "aplus": higher_trend == d and distance <= typical * 2 and rr <= 12 and right_half and stage != "forming"}
             if best is None or abs(entry - last["close"]) < abs(best["entry"] - last["close"]):
                 best = found
+        if best:
+            out.append(best)
+    return out
+
+
+def find_setups_v2(c, min_rr, seconds, history=None, max_age=150):
+    """The method from the trader's course material, stated as rules:
+    1. Trigger: a market structure shift, or a double break of structure (the second break in a row the same way). Breaks need a
+       candle BODY to close beyond the level. A single break of structure is not enough.
+    2. Points of interest behind the break: the order block (the last opposite candle right before the impulse that broke the
+       level, not the start of the whole leg) and the breaker (the body of the swing candle that was broken). The impulse must
+       leave a fair value gap.
+    3. Inducement: the first pullback after the break, confirmed only when price then closes beyond where the break leg ended.
+    4. A point of interest touched after the break is used up. Of those left, take the one closest to the inducement, beyond it.
+    5. Entry is a limit at that point of interest; price takes the inducement on its way in. Stop beyond the candle's wick.
+    6. Bigger picture: direction comes from the timeframe sixteen times higher (4h for a 15m setup). A+ also needs the move to
+       have started from a higher-timeframe order block, and no opposing higher-timeframe block in front of the target.
+    Returns at most one long and one short."""
+    if len(c) <= 80:
+        return []
+    newest, last = len(c) - 1, c[-1]
+    m = analyze(c)
+    recent100 = c[-100:]
+    typical = sum(k["high"] - k["low"] for k in recent100) / len(recent100)
+    buffer = typical * 0.1
+    big = regroup(history or c, seconds * 16)
+    htf = analyze(big) if len(big) >= 40 else {"blocks": [], "trend": 0}
+    zones = [b for b in htf["blocks"] if not b["broken"]]
+    up = lambda k: k["close"] > k["open"]
+    out = []
+    for d in (1, -1):
+        hi = (lambda k: k["high"]) if d == -1 else (lambda k: -k["low"])          # "against the trade" side, as a number that grows
+        lo = (lambda k: k["low"]) if d == -1 else (lambda k: -k["high"])           # "with the trade" side
+        best = None
+        for e in reversed(m["breaks"]):
+            t = e["index"]
+            if e["direction"] != d:
+                break                                       # structure has since turned the other way
+            if newest - t > max_age or t + 2 > newest:
+                continue
+            if not (e["kind"] == "MSS" or e["run"] == 2 or e["run"] == 3):
+                continue                                    # a single break, or a tired trend, is not a trigger
+            # the impulse that broke the level, and the candle right before it
+            start = t
+            while start - 1 > e["level_index"] and up(c[start - 1]) == (d == 1) and c[start - 1]["close"] != c[start - 1]["open"]:
+                start -= 1
+            ob = next((j for j in range(start - 1, max(start - 7, 0), -1) if up(c[j]) == (d == -1) and c[j]["close"] != c[j]["open"]), None)
+            if ob is None:
+                continue
+            gap = any((c[k + 1]["low"] > c[k - 1]["high"]) if d == 1 else (c[k + 1]["high"] < c[k - 1]["low"])
+                      for k in range(ob + 1, min(t + 1, newest - 1) + 1))
+            if not gap:
+                continue                                    # no fair value gap: the move was not impulsive enough
+            # inducement: first pullback after the break, confirmed by a close beyond the break leg's end
+            ext, idm, confirmed = t, None, None
+            for j in range(t + 1, newest + 1):
+                if (c[j]["close"] < c[ext]["low"]) if d == -1 else (c[j]["close"] > c[ext]["high"]):
+                    pull = c[ext + 1:j]
+                    if pull and any(up(k) == (d == -1) for k in pull):
+                        idm = max(hi(k) for k in pull) * (1 if d == -1 else -1)
+                        confirmed = j
+                        break
+                if lo(c[j]) < lo(c[ext]):
+                    ext = j
+            if idm is None:
+                continue                                    # no confirmed inducement yet
+            # points of interest: the order block, and the body of each broken swing candle (breakers)
+            pois = [{"kind": "OB", "near": c[ob]["low"] if d == -1 else c[ob]["high"],
+                     "far": max(k["high"] for k in c[ob:ob + 2]) if d == -1 else min(k["low"] for k in c[ob:ob + 2]), "time": c[ob]["time"],
+                     "top": c[ob]["high"], "bottom": c[ob]["low"]}]
+            levels = [e["level_index"]] + [p["level_index"] for p in m["breaks"] if p["direction"] == d and p["index"] < t and t - p["index"] < 60 and p["run"] == e["run"] - 1]
+            for li in levels:
+                k = c[li]
+                body_low, body_high = min(k["open"], k["close"]), max(k["open"], k["close"])
+                if body_high - body_low < typical * 0.15:
+                    continue                                # a doji has no body to return to
+                pois.append({"kind": "breaker", "near": body_low if d == -1 else body_high, "far": k["high"] if d == -1 else k["low"],
+                             "time": k["time"], "top": body_high, "bottom": body_low})
+            after = c[t + 1:newest]                         # everything since the break, except the candle still printing
+            live = []
+            for p in pois:
+                if any((k["high"] >= p["near"]) if d == -1 else (k["low"] <= p["near"]) for k in after):
+                    continue                                # touched since the break: used up
+                if (p["near"] - idm) * -d <= 0:
+                    continue                                # must sit beyond the inducement
+                live.append(p)
+            if not live:
+                continue
+            p = min(live, key=lambda q: abs(q["near"] - idm))
+            entry, stop = p["near"], p["far"] + buffer * -d
+            move = c[t:newest + 1]
+            target = min(k["low"] for k in move) if d == -1 else max(k["high"] for k in move)
+            # an opposing higher-timeframe block in front of the target is a roadblock: the target stops there
+            for z in zones:
+                if z["direction"] == -d:
+                    edge = z["top"] if d == -1 else z["bottom"]
+                    if (entry - edge) * -d > 0 and (edge - target) * -d > 0:
+                        target = edge
+            risk = abs(stop - entry)
+            if risk <= 0 or (entry - target) * -d <= 0:
+                continue
+            rr = abs(entry - target) / risk
+            if rr < min_rr:
+                continue
+            distance = abs(entry - last["close"])
+            if distance > typical * (3 if newest - t > 40 else 6):
+                continue                                    # price has left it behind
+            origin = max(hi(k) for k in c[e["level_index"]:t + 1]) * (1 if d == -1 else -1)
+            tapped = any(z["direction"] == d and z["bottom"] - typical <= origin <= z["top"] + typical for z in zones)
+            touched_now = (last["high"] >= entry) if d == -1 else (last["low"] <= entry)
+            taken = (last["high"] >= idm) if d == -1 else (last["low"] <= idm)
+            best = {"direction": d, "stage": "at_block" if touched_now else "ready", "entry": entry, "stop": stop, "target": target, "rr": rr,
+                    "time": p["time"], "block_top": p["top"], "block_bottom": p["bottom"], "poi": p["kind"],
+                    "trigger": "MSS" if e["kind"] == "MSS" else "double BOS", "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "typical": typical,
+                    "with_trend": htf["trend"] == d, "htf_poi": tapped,
+                    "aplus": htf["trend"] == d and tapped and rr <= 12}
+            break
         if best:
             out.append(best)
     return out
@@ -301,13 +422,13 @@ def picture(candles, setup, symbol, timeframe):
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return None
-    c = candles[-110:]
+    c = candles[-56:]                                       # zoomed in: the move, the block and the return, not the whole day
     width, height, left, right, top, bottom = 900, 520, 14, 778, 54, 502
     hi = max([k["high"] for k in c] + [setup["entry"], setup["stop"], setup["target"]])
     lo = min([k["low"] for k in c] + [setup["entry"], setup["stop"], setup["target"]])
     pad = (hi - lo) * 0.06
     hi, lo = hi + pad, lo - pad
-    step = (right - left) / (len(c) + 14)
+    step = (right - left) / (len(c) + 12)
     x = lambda i: left + (i + 0.5) * step
     y = lambda p: top + (hi - p) / (hi - lo) * (bottom - top)
     image = Image.new("RGB", (width, height), (12, 14, 18))
@@ -325,9 +446,25 @@ def picture(candles, setup, symbol, timeframe):
     draw.rectangle([start, min(y(setup["entry"]), y(setup["target"])), right, max(y(setup["entry"]), y(setup["target"]))], fill=up + (34,))
     for i, k in enumerate(c):
         colour = up if k["close"] >= k["open"] else down
-        draw.line([x(i), y(k["high"]), x(i), y(k["low"])], fill=colour, width=1)
+        draw.line([x(i), y(k["high"]), x(i), y(k["low"])], fill=colour, width=2)
         a, b = y(max(k["open"], k["close"])), y(min(k["open"], k["close"]))
         draw.rectangle([x(i) - step * 0.34, a, x(i) + step * 0.34, max(b, a + 1)], fill=colour)
+    if setup.get("block_top"):                              # the order block candle, outlined
+        first = next((i for i, k in enumerate(c) if k["time"] >= setup["time"]), None)
+        if first is not None:
+            draw.rectangle([x(first) - step / 2, y(setup["block_top"]), right, y(setup["block_bottom"])], outline=(140, 151, 171, 200), width=1)
+            draw.text((x(first) + step, y(setup["block_top"]) + 2), setup.get("poi", "OB"), fill=(140, 151, 171), font=small)
+    last = c[-1]["close"]
+    draw.line([left, y(last), right, y(last)], fill=(125, 133, 144, 150), width=1)
+    if setup.get("idm") and lo < setup["idm"] < hi:         # the inducement: liquidity price takes on its way in
+        for x0 in range(int(start), int(right), 10):
+            draw.line([x0, y(setup["idm"]), x0 + 5, y(setup["idm"])], fill=(242, 169, 59), width=1)
+        draw.text((start + 4, y(setup["idm"]) - 15), "$ $ $  inducement" + ("  (taken)" if setup.get("idm_taken") else ""), fill=(242, 169, 59), font=small)
+    if setup.get("break_level") and lo < setup["break_level"] < hi:
+        broke = next((i for i, k in enumerate(c) if k["time"] >= setup["break_time"]), None)
+        if broke is not None:
+            draw.line([left, y(setup["break_level"]), x(broke), y(setup["break_level"])], fill=(125, 133, 144), width=1)
+            draw.text((max(x(broke) - 90, left), y(setup["break_level"]) + 3), setup["trigger"], fill=(125, 133, 144), font=small)
     for name, price, colour in (("Entry", setup["entry"], blue), ("Stop", setup["stop"], down), ("Target", setup["target"], up)):
         draw.line([start, y(price), right, y(price)], fill=colour, width=1)
         draw.rectangle([right, y(price) - 9, width - 2, y(price) + 9], fill=colour)
@@ -405,10 +542,12 @@ def main():
                 continue
             live = candles[-1]["close"]
             trend = bigger_trend(closed, seconds)
-            for s in find_setups(closed[-800:], config.get("min_rr", 3.5), trend):
+            found = (find_setups_v2(closed[-800:], config.get("min_rr", 3.5), seconds, history=closed) if config.get("method", "strict") == "strict"
+                     else find_setups(closed[-800:], config.get("min_rr", 3.5), trend))
+            for s in found:
                 side = "long" if s["direction"] == 1 else "short"
                 print(f"{symbol} {timeframe} {side} {s['stage']} {'A+' if s['aplus'] else 'A' if s['with_trend'] else 'counter-trend'} "
-                      f"entry {price_text(s['entry'], symbol)} {s['rr']:.1f}R")
+                      f"{s.get('trigger', '')} {s.get('poi', '')} entry {price_text(s['entry'], symbol)} {s['rr']:.1f}R")
                 if "--test" in sys.argv and can_send and not tested:        # one chart link for the first setup found, whatever its grade
                     tested = True
                     notify(f"Test from the cloud scanner: {symbol} {timeframe} {side_of(s)}, {s['stage']}. Entry {price_text(s['entry'], symbol)}, "
@@ -420,15 +559,18 @@ def main():
                 events = []
                 if s["stage"] == "ready" and config.get("alert_ready", True):
                     events.append(("ready", f"waiting for price to return to {price_text(s['entry'], symbol)}"))
-                if s["stage"] == "ready" and config.get("alert_approaching", True) and 0 < gap <= s["typical"]:
-                    events.append(("near", f"price is approaching the order block (now {price_text(live, symbol)})"))
+                taken = "idm" in s and (live - s["idm"]) * -s["direction"] >= 0
+                if s["stage"] == "ready" and config.get("alert_approaching", True) and gap > 0 and (taken if "idm" in s else gap <= s["typical"]):
+                    events.append(("near", (f"inducement taken, price is heading for the {s['poi']} (now {price_text(live, symbol)})" if "idm" in s
+                                            else f"price is approaching the order block (now {price_text(live, symbol)})")))
                 if (s["stage"] == "at_block" or gap <= 0) and config.get("alert_at_block", True):
                     events.append(("at", "price is at the order block now"))
                 base = f"{symbol}|{timeframe}|{s['direction']}|{s['time']}"
                 for tag, place in events:
                     if base + "|" + tag in sent:
                         continue
-                    text = (f"{grade(s)}: {symbol} {timeframe} {side}, {place}. Entry {price_text(s['entry'], symbol)}, "
+                    how = f" [{s['trigger']}, {s['poi']}{', from a higher-timeframe block' if s.get('htf_poi') else ''}]" if "trigger" in s else ""
+                    text = (f"{grade(s)}: {symbol} {timeframe} {side}{how}, {place}. Entry {price_text(s['entry'], symbol)}, "
                             f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")
                     print("  ALERT:", text)
                     jpeg = picture(closed, s, symbol, timeframe) if config.get("send_picture", True) else None
