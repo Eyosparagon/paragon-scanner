@@ -198,44 +198,76 @@ def find_setups(c, min_rr, higher_trend=0, max_age=150):
     return out
 
 
-def find_setups_v2(c, min_rr, seconds, history=None, max_age=150):
-    """The method from the trader's course material, stated as rules:
-    1. Trigger: a market structure shift, or a double break of structure (the second break in a row the same way). Breaks need a
-       candle BODY to close beyond the level. A single break of structure is not enough.
-    2. Points of interest behind the break: the order block (the last opposite candle right before the impulse that broke the
-       level, not the start of the whole leg) and the breaker (the body of the swing candle that was broken). The impulse must
-       leave a fair value gap.
-    3. Inducement: the first pullback after the break, confirmed only when price then closes beyond where the break leg ended.
-    4. A point of interest touched after the break is used up. Of those left, take the one closest to the inducement, beyond it.
-    5. Entry is a limit at that point of interest; price takes the inducement on its way in. Stop beyond the candle's wick.
-    6. Bigger picture: direction comes from the timeframe sixteen times higher (4h for a 15m setup). A+ also needs the move to
-       have started from a higher-timeframe order block, and no opposing higher-timeframe block in front of the target.
+def external_structure(c, warm=50):
+    """External (major) structure only. In an up-leg the level to beat is the highest high since the last break (the weak high),
+    and the level that must hold is the low the breaking push started from (the strong low). Highs and lows made inside the
+    range between them are internal and never produce a break here. Breaks need a candle body to close beyond the level."""
+    breaks = []
+    if len(c) <= warm + 5:
+        return breaks
+    top = max(range(warm), key=lambda i: c[i]["high"])      # weak high / strong high candidate
+    bottom = min(range(warm), key=lambda i: c[i]["low"])
+    trend = 0
+    for j in range(warm, len(c)):
+        k = c[j]
+        if k["close"] > c[top]["high"] and j - top >= 3:
+            kind = "MSS" if trend == -1 else "BOS"
+            breaks.append({"index": j, "level_index": top, "direction": 1, "kind": kind, "run": 1})
+            bottom = min(range(top, j + 1), key=lambda i: c[i]["low"])       # the push started here: the strong low
+            trend, top = 1, j
+        elif k["close"] < c[bottom]["low"] and j - bottom >= 3:
+            kind = "MSS" if trend == 1 else "BOS"
+            breaks.append({"index": j, "level_index": bottom, "direction": -1, "kind": kind, "run": 1})
+            top = max(range(bottom, j + 1), key=lambda i: c[i]["high"])      # the strong high
+            trend, bottom = -1, j
+        else:
+            if trend >= 0 and k["high"] > c[top]["high"]:
+                top = j                                     # the up-leg is still extending: the weak high moves up
+            if trend <= 0 and k["low"] < c[bottom]["low"]:
+                bottom = j
+    return breaks
+
+
+def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
+    """The trader's method, stated as rules:
+    1. Trigger: a break of EXTERNAL structure (the weak high or strong low of the current leg), by a candle BODY closing beyond it.
+       Internal structure only counts in the direction of the external trend, as a shift or second break, with a strong push.
+    2. The breaking push must leave a fair value gap.
+    3. Order block: the last opposite candle right before the push that broke the level. Wick to wick.
+    4. Mitigation: an order block price has touched since the break is used up.
+    5. Liquidity: at least one internal swing must have formed after the break, between price and the block (a range is better).
+    6. Entry is a limit at the block's body edge, stop beyond its wick, target the weak high or low the push left.
+    7. Bigger picture: direction comes from the timeframe sixteen times higher (4h for a 15m setup). The target is a level price
+       has already reached since the break, so nothing new stands in front of it.
     Returns at most one long and one short."""
     if len(c) <= 80:
         return []
     newest, last = len(c) - 1, c[-1]
-    m = analyze(c)
+    inner, outer = analyze(c), external_structure(c)
     recent100 = c[-100:]
     typical = sum(k["high"] - k["low"] for k in recent100) / len(recent100)
-    buffer = typical * 0.1
+    buffer = typical * 0.05
     big = regroup(history or c, seconds * 16)
     htf = analyze(big) if len(big) >= 40 else {"blocks": [], "trend": 0}
     zones = [b for b in htf["blocks"] if not b["broken"]]
     up = lambda k: k["close"] > k["open"]
     out = []
     for d in (1, -1):
-        hi = (lambda k: k["high"]) if d == -1 else (lambda k: -k["low"])          # "against the trade" side, as a number that grows
-        lo = (lambda k: k["low"]) if d == -1 else (lambda k: -k["high"])           # "with the trade" side
+        hi = (lambda k: k["high"]) if d == -1 else (lambda k: -k["low"])          # the side the stop is on, as a number that grows
         best = None
-        for e in reversed(m["breaks"]):
+        candidates = []
+        if outer and outer[-1]["direction"] == d:
+            candidates.append((outer[-1], "external"))
+            for e in reversed(inner["breaks"]):             # internal breaks only count with the external trend, and after its break
+                if e["direction"] != d or e["index"] <= outer[-1]["index"]:
+                    break
+                if e["kind"] == "MSS" or e["run"] == 2:
+                    candidates.append((e, "internal"))
+        for e, scope in candidates:
             t = e["index"]
-            if e["direction"] != d:
-                break                                       # structure has since turned the other way
             if newest - t > max_age or t + 2 > newest:
                 continue
-            if not (e["kind"] == "MSS" or e["run"] == 2 or e["run"] == 3):
-                continue                                    # a single break, or a tired trend, is not a trigger
-            # the impulse that broke the level, and the candle right before it
+            # the push that broke the level, and the candle right before it
             start = t
             while start - 1 > e["level_index"] and up(c[start - 1]) == (d == 1) and c[start - 1]["close"] != c[start - 1]["open"]:
                 start -= 1
@@ -245,71 +277,44 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150):
             gap = any((c[k + 1]["low"] > c[k - 1]["high"]) if d == 1 else (c[k + 1]["high"] < c[k - 1]["low"])
                       for k in range(ob + 1, min(t + 1, newest - 1) + 1))
             if not gap:
-                continue                                    # no fair value gap: the move was not impulsive enough
-            # inducement: first pullback after the break, confirmed by a close beyond the break leg's end
-            ext, idm, confirmed = t, None, None
-            for j in range(t + 1, newest + 1):
-                if (c[j]["close"] < c[ext]["low"]) if d == -1 else (c[j]["close"] > c[ext]["high"]):
-                    pull = c[ext + 1:j]
-                    if pull and any(up(k) == (d == -1) for k in pull):
-                        idm = max(hi(k) for k in pull) * (1 if d == -1 else -1)
-                        confirmed = j
-                        break
-                if lo(c[j]) < lo(c[ext]):
-                    ext = j
-            if idm is None:
-                continue                                    # no confirmed inducement yet
-            # points of interest: the order block, and the body of each broken swing candle (breakers)
-            pois = [{"kind": "OB", "near": c[ob]["low"] if d == -1 else c[ob]["high"],
-                     "far": max(k["high"] for k in c[ob:ob + 2]) if d == -1 else min(k["low"] for k in c[ob:ob + 2]), "time": c[ob]["time"],
-                     "top": c[ob]["high"], "bottom": c[ob]["low"]}]
-            levels = [e["level_index"]] + [p["level_index"] for p in m["breaks"] if p["direction"] == d and p["index"] < t and t - p["index"] < 60 and p["run"] == e["run"] - 1]
-            for li in levels:
-                k = c[li]
-                body_low, body_high = min(k["open"], k["close"]), max(k["open"], k["close"])
-                if body_high - body_low < typical * 0.15:
-                    continue                                # a doji has no body to return to
-                pois.append({"kind": "breaker", "near": body_low if d == -1 else body_high, "far": k["high"] if d == -1 else k["low"],
-                             "time": k["time"], "top": body_high, "bottom": body_low})
-            after = c[t + 1:newest]                         # everything since the break, except the candle still printing
-            live = []
-            for p in pois:
-                if any((k["high"] >= p["near"]) if d == -1 else (k["low"] <= p["near"]) for k in after):
-                    continue                                # touched since the break: used up
-                if (p["near"] - idm) * -d <= 0:
-                    continue                                # must sit beyond the inducement
-                live.append(p)
-            if not live:
+                continue                                    # no fair value gap: the push was not impulsive
+            push = abs(c[t]["close"] - c[start]["open"])
+            if scope == "internal" and push < typical * 3:
+                continue                                    # an internal break needs a strong push to count
+            entry = c[ob]["open"]                           # the body edge nearest price (a down candle's open, for a long)
+            far = c[ob]["high"] if d == -1 else c[ob]["low"]
+            if any((k["high"] >= entry) if d == -1 else (k["low"] <= entry) for k in c[t + 1:newest]):
+                continue                                    # mitigated: price has been back to it since the break
+            if (last["close"] - far) * d <= 0:
+                continue                                    # price has closed through the block
+            # liquidity: internal swings formed after the break, resting between price and the block
+            pools = [w["price"] for w in inner["swings"] if w["index"] > t and w["is_high"] == (d == -1) and (w["price"] - entry) * d > 0]
+            if not pools:
                 continue
-            p = min(live, key=lambda q: abs(q["near"] - idm))
-            entry, stop = p["near"], p["far"] + buffer * -d
+            idm = min(pools, key=lambda p: abs(p - entry))
+            stop = far + buffer * -d
             move = c[t:newest + 1]
             target = min(k["low"] for k in move) if d == -1 else max(k["high"] for k in move)
-            # an opposing higher-timeframe block in front of the target is a roadblock: the target stops there
-            for z in zones:
-                if z["direction"] == -d:
-                    edge = z["top"] if d == -1 else z["bottom"]
-                    if (entry - edge) * -d > 0 and (edge - target) * -d > 0:
-                        target = edge
             risk = abs(stop - entry)
             if risk <= 0 or (entry - target) * -d <= 0:
                 continue
             rr = abs(entry - target) / risk
             if rr < min_rr:
                 continue
-            distance = abs(entry - last["close"])
-            if distance > typical * (3 if newest - t > 40 else 6):
-                continue                                    # price has left it behind
+            if abs(entry - last["close"]) > typical * 12:
+                continue                                    # price has left it far behind
             origin = max(hi(k) for k in c[e["level_index"]:t + 1]) * (1 if d == -1 else -1)
             tapped = any(z["direction"] == d and z["bottom"] - typical <= origin <= z["top"] + typical for z in zones)
             touched_now = (last["high"] >= entry) if d == -1 else (last["low"] <= entry)
             taken = (last["high"] >= idm) if d == -1 else (last["low"] <= idm)
+            ranging = len(pools) >= 2
             best = {"direction": d, "stage": "at_block" if touched_now else "ready", "entry": entry, "stop": stop, "target": target, "rr": rr,
-                    "time": p["time"], "block_top": p["top"], "block_bottom": p["bottom"], "poi": p["kind"],
-                    "trigger": "MSS" if e["kind"] == "MSS" else "double BOS", "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
-                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "typical": typical,
+                    "time": c[ob]["time"], "block_top": c[ob]["high"], "block_bottom": c[ob]["low"], "poi": "OB",
+                    "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
+                    "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical,
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
-                    "aplus": htf["trend"] == d and tapped and rr <= 12}
+                    "aplus": scope == "external" and htf["trend"] == d and (tapped or ranging) and rr <= 12}
             break
         if best:
             out.append(best)
@@ -459,7 +464,7 @@ def picture(candles, setup, symbol, timeframe):
     if setup.get("idm") and lo < setup["idm"] < hi:         # the inducement: liquidity price takes on its way in
         for x0 in range(int(start), int(right), 10):
             draw.line([x0, y(setup["idm"]), x0 + 5, y(setup["idm"])], fill=(242, 169, 59), width=1)
-        draw.text((start + 4, y(setup["idm"]) - 15), "$ $ $  inducement" + ("  (taken)" if setup.get("idm_taken") else ""), fill=(242, 169, 59), font=small)
+        draw.text((start + 4, y(setup["idm"]) - 15), "$ $ $  liquidity" + ("  (taken)" if setup.get("idm_taken") else ""), fill=(242, 169, 59), font=small)
     if setup.get("break_level") and lo < setup["break_level"] < hi:
         broke = next((i for i, k in enumerate(c) if k["time"] >= setup["break_time"]), None)
         if broke is not None:
@@ -561,7 +566,7 @@ def main():
                     events.append(("ready", f"waiting for price to return to {price_text(s['entry'], symbol)}"))
                 taken = "idm" in s and (live - s["idm"]) * -s["direction"] >= 0
                 if s["stage"] == "ready" and config.get("alert_approaching", True) and gap > 0 and (taken if "idm" in s else gap <= s["typical"]):
-                    events.append(("near", (f"inducement taken, price is heading for the {s['poi']} (now {price_text(live, symbol)})" if "idm" in s
+                    events.append(("near", (f"liquidity taken, price is heading for the order block (now {price_text(live, symbol)})" if "idm" in s
                                             else f"price is approaching the order block (now {price_text(live, symbol)})")))
                 if (s["stage"] == "at_block" or gap <= 0) and config.get("alert_at_block", True):
                     events.append(("at", "price is at the order block now"))
