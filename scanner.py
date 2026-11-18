@@ -253,7 +253,11 @@ def find_chat(token):
     """The chat to send to: whoever last wrote to the bot. Used when no TELEGRAM_CHAT secret is set."""
     try:
         done = subprocess.run(["curl", "-s", "-m", "30", f"https://api.telegram.org/bot{token}/getUpdates"], capture_output=True, text=True)
-        chats = [u["message"]["chat"]["id"] for u in json.loads(done.stdout).get("result", []) if "message" in u]
+        answer = json.loads(done.stdout)
+        if not answer.get("ok"):
+            print("Telegram did not accept the bot token:", str(answer.get("description", ""))[:80])
+            return None
+        chats = [u["message"]["chat"]["id"] for u in answer.get("result", []) if "message" in u]
         return str(chats[-1]) if chats else None
     except Exception:
         return None
