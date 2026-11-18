@@ -274,10 +274,11 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             ob = next((j for j in range(start - 1, max(start - 7, 0), -1) if up(c[j]) == (d == -1) and c[j]["close"] != c[j]["open"]), None)
             if ob is None:
                 continue
-            gap = any((c[k + 1]["low"] > c[k - 1]["high"]) if d == 1 else (c[k + 1]["high"] < c[k - 1]["low"])
-                      for k in range(ob + 1, min(t + 1, newest - 1) + 1))
-            if not gap:
+            gap = next((k for k in range(ob + 1, min(t + 1, newest - 1) + 1)
+                        if ((c[k + 1]["low"] > c[k - 1]["high"]) if d == 1 else (c[k + 1]["high"] < c[k - 1]["low"]))), None)
+            if gap is None:
                 continue                                    # no fair value gap: the push was not impulsive
+            fvg = sorted([c[gap - 1]["high"], c[gap + 1]["low"]] if d == 1 else [c[gap + 1]["high"], c[gap - 1]["low"]])
             push = abs(c[t]["close"] - c[start]["open"])
             if scope == "internal" and push < typical * 3:
                 continue                                    # an internal break needs a strong push to count
@@ -313,6 +314,7 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
                     "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
                     "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
                     "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical,
+                    "fvg_time": c[gap - 1]["time"], "fvg_bottom": fvg[0], "fvg_top": fvg[1],
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
                     "aplus": scope == "external" and htf["trend"] == d and (tapped or ranging) and rr <= 12}
             break
@@ -459,6 +461,11 @@ def picture(candles, setup, symbol, timeframe):
         if first is not None:
             draw.rectangle([x(first) - step / 2, y(setup["block_top"]), right, y(setup["block_bottom"])], outline=(140, 151, 171, 200), width=1)
             draw.text((x(first) + step, y(setup["block_top"]) + 2), setup.get("poi", "OB"), fill=(140, 151, 171), font=small)
+    if setup.get("fvg_top"):                                # the fair value gap the push left
+        first = next((i for i, k in enumerate(c) if k["time"] >= setup["fvg_time"]), None)
+        if first is not None:
+            draw.rectangle([x(first), y(setup["fvg_top"]), min(x(first) + step * 14, right), y(setup["fvg_bottom"])], fill=(140, 151, 171, 46))
+            draw.text((x(first) + step * 2.5, (y(setup["fvg_top"]) + y(setup["fvg_bottom"])) / 2 - 7), "FVG", fill=(170, 180, 198), font=small)
     last = c[-1]["close"]
     draw.line([left, y(last), right, y(last)], fill=(125, 133, 144, 150), width=1)
     if setup.get("idm") and lo < setup["idm"] < hi:         # the inducement: liquidity price takes on its way in
@@ -547,8 +554,12 @@ def main():
                 continue
             live = candles[-1]["close"]
             trend = bigger_trend(closed, seconds)
-            found = (find_setups_v2(closed[-800:], config.get("min_rr", 3.5), seconds, history=closed) if config.get("method", "strict") == "strict"
-                     else find_setups(closed[-800:], config.get("min_rr", 3.5), trend))
+            # the stricter method decides what can be A+; the earlier rules still stand, graded A at most
+            found = find_setups_v2(closed[-800:], config.get("min_rr", 3.5), seconds, history=closed)
+            for old in find_setups(closed[-800:], config.get("min_rr", 3.5), trend):
+                if not any(new["direction"] == old["direction"] for new in found):
+                    old["aplus"] = False
+                    found.append(old)
             for s in found:
                 side = "long" if s["direction"] == 1 else "short"
                 print(f"{symbol} {timeframe} {side} {s['stage']} {'A+' if s['aplus'] else 'A' if s['with_trend'] else 'counter-trend'} "
