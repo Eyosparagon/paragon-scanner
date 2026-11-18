@@ -442,5 +442,22 @@ def main():
     print("done:", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()))
 
 
+def run():
+    """One scan, or with "--loop MINUTES" a scan every 90 seconds for that long (how the cloud job stays quick to alert)."""
+    if "--loop" not in sys.argv:
+        return main()
+    end = time.time() + float(sys.argv[sys.argv.index("--loop") + 1]) * 60
+    while True:
+        try:
+            main()
+        except Exception as error:                          # one bad pass must not end the watch
+            print("scan failed:", type(error).__name__)
+        if "--test" in sys.argv:
+            sys.argv.remove("--test")
+        if time.time() + 90 > end:
+            break
+        time.sleep(90)
+
+
 if __name__ == "__main__":
-    main()
+    run()
