@@ -231,9 +231,10 @@ def external_structure(c, warm=50):
 def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
     """The trader's method, stated as rules:
     1. Trigger: a break of EXTERNAL structure (the weak high or strong low of the current leg), by a candle BODY closing beyond it.
-       Internal structure only counts in the direction of the external trend, as a shift or second break, with a strong push.
+       Within the leg that made that break, every push is a candidate; a push inside the leg must be strong (three typical candles).
     2. The breaking push must leave a fair value gap.
-    3. Order block: the last opposite candle right before the push that broke the level. Wick to wick.
+    3. Order block: the last opposite candle right before a push. Of the untouched ones, the block with the strongest push wins.
+       A+ needs that push to be massive (three typical candles within six) and the higher timeframe to agree.
     4. Mitigation: an order block price has touched since the break is used up.
     5. Liquidity: at least one internal swing must have formed after the break, between price and the block (a range is better).
     6. Entry is a limit at the block's body edge, stop beyond its wick, target the weak high or low the push left.
@@ -257,12 +258,13 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
         best = None
         candidates = []
         if outer and outer[-1]["direction"] == d:
-            candidates.append((outer[-1], "external"))
-            for e in reversed(inner["breaks"]):             # internal breaks only count with the external trend, and after its break
-                if e["direction"] != d or e["index"] <= outer[-1]["index"]:
-                    break
-                if e["kind"] == "MSS" or e["run"] == 2:
-                    candidates.append((e, "internal"))
+            # every push inside the leg that broke external structure is a candidate: the one at the leg's origin, the ones on
+            # the way, and the one that finally broke the level. The strongest push with an untouched block wins.
+            ext = outer[-1]
+            leg = range(ext["level_index"], ext["index"] + 1)
+            origin_i = max(leg, key=lambda i: c[i]["high"]) if d == -1 else min(leg, key=lambda i: c[i]["low"])
+            candidates.append((ext, "external"))
+            candidates += [(e, "internal") for e in inner["breaks"] if e["direction"] == d and e["index"] >= origin_i]
         for e, scope in candidates:
             t = e["index"]
             if newest - t > max_age or t + 2 > newest:
@@ -279,11 +281,12 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             if gap is None:
                 continue                                    # no fair value gap: the push was not impulsive
             fvg = sorted([c[gap - 1]["high"], c[gap + 1]["low"]] if d == 1 else [c[gap + 1]["high"], c[gap - 1]["low"]])
-            push = abs(c[t]["close"] - c[start]["open"])
-            if scope == "internal" and push < typical * 3:
-                continue                                    # an internal break needs a strong push to count
             entry = c[ob]["open"]                           # the body edge nearest price (a down candle's open, for a long)
-            far = c[ob]["high"] if d == -1 else c[ob]["low"]
+            run = c[ob + 1:ob + 7]                          # how far price travelled in the six candles after the block
+            push = (entry - min(k["low"] for k in run)) if d == -1 else (max(k["high"] for k in run) - entry)
+            if scope == "internal" and push < typical * 3:
+                continue                                    # a push inside the leg needs to be strong to count
+            far = max(k["high"] for k in c[ob:start + 1]) if d == -1 else min(k["low"] for k in c[ob:start + 1])
             if any((k["high"] >= entry) if d == -1 else (k["low"] <= entry) for k in c[t + 1:newest]):
                 continue                                    # mitigated: price has been back to it since the break
             if (last["close"] - far) * d <= 0:
@@ -309,15 +312,16 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             touched_now = (last["high"] >= entry) if d == -1 else (last["low"] <= entry)
             taken = (last["high"] >= idm) if d == -1 else (last["low"] <= idm)
             ranging = len(pools) >= 2
+            if best is not None and push <= best["push"]:
+                continue                                    # a stronger push has already been found in this leg
             best = {"direction": d, "stage": "at_block" if touched_now else "ready", "entry": entry, "stop": stop, "target": target, "rr": rr,
                     "time": c[ob]["time"], "block_top": c[ob]["high"], "block_bottom": c[ob]["low"], "poi": "OB",
                     "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
                     "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
-                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical,
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push,
                     "fvg_time": c[gap - 1]["time"], "fvg_bottom": fvg[0], "fvg_top": fvg[1],
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
-                    "aplus": scope == "external" and htf["trend"] == d and (tapped or ranging) and rr <= 12}
-            break
+                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15}
         if best:
             out.append(best)
     return out
