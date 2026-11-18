@@ -6,7 +6,7 @@ on:
   workflow_dispatch:            # lets you press "Run workflow" to try it by hand
     inputs:
       test:
-        description: "Send one test chart link to WhatsApp"
+        description: "Send one test alert with its chart"
         type: boolean
         default: false
 
@@ -37,6 +37,8 @@ jobs:
         env:
           # the secret was saved under the name OANDO_TOKEN, so either spelling is accepted
           OANDA_TOKEN: ${{ secrets.OANDA_TOKEN || secrets.OANDO_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
           WHATABOT_KEY: ${{ secrets.WHATABOT_KEY }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
       - name: Save chart pictures
