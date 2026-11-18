@@ -258,8 +258,12 @@ def find_chat(token):
             print("Telegram did not accept the bot token:", str(answer.get("description", ""))[:80])
             return None
         chats = [u["message"]["chat"]["id"] for u in answer.get("result", []) if "message" in u]
+        me = subprocess.run(["curl", "-s", "-m", "30", f"https://api.telegram.org/bot{token}/getMe"], capture_output=True, text=True)
+        name = json.loads(me.stdout).get("result", {}).get("username", "?")
+        print(f"Telegram: this token belongs to the bot @{name}; messages waiting for it: {len(answer.get('result', []))}")
         return str(chats[-1]) if chats else None
-    except Exception:
+    except Exception as error:
+        print("Telegram: could not look up the chat:", type(error).__name__)
         return None
 
 
