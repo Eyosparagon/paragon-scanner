@@ -14,7 +14,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OANDA = "https://api-fxpractice.oanda.com"
 AGENT = "paragon-cloud-scanner/1.0"
 SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
-GRANULARITY = {300: "M5", 900: "M15", 1800: "M30", 3600: "H1", 14400: "H4"}
+GRANULARITY = {60: "M1", 300: "M5", 600: "M10", 900: "M15", 1800: "M30", 3600: "H1", 14400: "H4"}
+LOWER = {900: 300, 3600: 900, 1800: 600, 300: 60, 14400: 3600}       # the timeframe an entry is refined on: 5m for a 15m setup
 OTHERS = {"GOLD": "XAU_USD", "SILVER": "XAG_USD", "US30": "US30_USD", "NAS100": "NAS100_USD", "SPX500": "SPX500_USD"}
 
 
@@ -48,6 +49,46 @@ def fetch_candles(symbol, seconds, token, count=4000):
             continue
         out.append({"time": int(float(row["time"])), "open": float(mid["o"]), "high": float(mid["h"]), "low": float(mid["l"]),
                     "close": float(mid["c"]), "complete": bool(row.get("complete"))})
+    return out
+
+
+def fetch_range(symbol, seconds, start, end, token):
+    """Candles between two moments (used to look inside one order block on a lower timeframe)."""
+    query = urllib.parse.urlencode({"granularity": GRANULARITY[seconds], "from": start, "to": end, "price": "M"})
+    request = urllib.request.Request(f"{OANDA}/v3/instruments/{symbol}/candles?{query}",
+                                     headers={"Authorization": "Bearer " + token, "Accept-Datetime-Format": "UNIX", "User-Agent": AGENT})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        rows = json.load(response).get("candles", [])
+    return [{"time": int(float(r["time"])), "open": float(r["mid"]["o"]), "high": float(r["mid"]["h"]), "low": float(r["mid"]["l"]),
+             "close": float(r["mid"]["c"])} for r in rows if r.get("mid") and r.get("complete")]
+
+
+def refine_entry(setup, lower, closed):
+    """The 5m-or-15m choice. A wide order block (more than 1.2 typical candles) is refined to the block inside it on the lower
+    timeframe: the last opposite candle before price left. A small, clean block is entered as it is. `lower` holds the lower
+    timeframe's candles covering the block. Returns the setup, changed or not."""
+    d = setup["direction"]
+    if setup["block_top"] - setup["block_bottom"] <= setup["typical"] * 1.2 or not lower:
+        return setup
+    up = lambda k: k["close"] > k["open"]
+    pick = next((i for i in range(len(lower) - 1, -1, -1) if up(lower[i]) == (d == -1) and lower[i]["close"] != lower[i]["open"]), None)
+    if pick is None:
+        return setup
+    k = lower[pick]
+    body = abs(k["close"] - k["open"])
+    entry = k["open"] if body < (k["high"] - k["low"]) - body else (k["low"] if d == -1 else k["high"])
+    far = max(x["high"] for x in lower[pick:]) if d == -1 else min(x["low"] for x in lower[pick:])
+    stop = far + setup["typical"] * 0.05 * -d
+    risk = abs(stop - entry)
+    if risk <= 0 or (entry - setup["entry"]) * d > 0:      # it must sit deeper in the block than the plain entry, never shallower
+        return setup
+    since = [x for x in closed if x["time"] > setup["break_time"]][:-1]
+    if any((x["high"] >= entry) if d == -1 else (x["low"] <= entry) for x in since):
+        return setup                                        # price has already been back to the refined level
+    out = dict(setup, entry=entry, stop=stop, rr=abs(entry - setup["target"]) / risk, refined=True,
+               block_top=k["high"], block_bottom=k["low"], time=k["time"])
+    last = closed[-1]
+    out["stage"] = "at_block" if ((last["high"] >= entry) if d == -1 else (last["low"] <= entry)) else "ready"
     return out
 
 
@@ -234,8 +275,9 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
        Within the leg that made that break, every push is a candidate; a push inside the leg must be strong (three typical candles).
     2. The breaking push must leave a fair value gap.
     3. Order block: the last opposite candle right before a push. Of the untouched ones, the block with the strongest push wins.
-       A+ needs that push to be massive (three typical candles within six), the higher timeframe to agree, and the move to
-       have started by sweeping an earlier untouched swing.
+       A+ is the full chain: direction from the timeframe sixteen times higher (4h for a 15m setup); liquidity one timeframe
+       up (1h) hunted at the origin; the break of structure on this timeframe with a massive push; then the entry, taken on
+       this timeframe's block or on the block inside it one timeframe down (5m), depending on how wide the block is.
     8. Entry is a limit order, unless price is coming at the block with momentum: then wait for a rejection there first.
     4. Mitigation: an order block price has touched since the break is used up.
     5. Liquidity: at least one internal swing must have formed after the break, between price and the block (a range is better).
@@ -253,6 +295,9 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
     big = regroup(history or c, seconds * 16)
     htf = analyze(big) if len(big) >= 40 else {"blocks": [], "trend": 0}
     zones = [b for b in htf["blocks"] if not b["broken"]]
+    full = history or c
+    big4 = regroup(full, seconds * 4)
+    up4 = analyze(big4, n=2) if len(big4) >= 20 else {"swings": []}
     up = lambda k: k["close"] > k["open"]
     out = []
     for d in (1, -1):
@@ -322,6 +367,17 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
             swept = any(w["is_high"] == (d == -1) and ob - 80 <= w["index"] <= ob - 3 and (tip - w["price"]) * -d > 0
                         and all((k["high"] <= w["price"]) if d == -1 else (k["low"] >= w["price"]) for k in c[w["index"] + 1:max(ob - 2, 0)])
                         for w in inner["swings"])
+            # the liquidity hunt one timeframe up (1h for a 15m setup): the origin must take a swing there that had been left
+            # alone, within the last 72 of those candles. Two such levels close together are equal highs or lows.
+            block_time = c[max(ob - 2, 0)]["time"]
+            hunted = []
+            for w in up4["swings"]:
+                ends = big4[w["index"]]["time"] + seconds * 4
+                if w["is_high"] != (d == -1) or ends > block_time or block_time - ends > 72 * seconds * 4 or (tip - w["price"]) * -d <= 0:
+                    continue
+                if all((k["high"] <= w["price"]) if d == -1 else (k["low"] >= w["price"]) for k in full if ends <= k["time"] < block_time):
+                    hunted.append(w["price"])
+            equal = any(abs(a - b) <= typical * 0.6 for i, a in enumerate(hunted) for b in hunted[i + 1:])
             # is price coming at the block fast? then a limit order is not enough: wait for it to be rejected first
             fast = (last["close"] - c[newest - 3]["close"]) * -d >= typical * 2.5 or (last["close"] - last["open"]) * -d >= typical * 1.5
             if best is not None and push <= best["push"]:
@@ -330,10 +386,10 @@ def find_setups_v2(c, min_rr, seconds, history=None, max_age=150, swing=10):
                     "time": c[ob]["time"], "block_top": c[ob]["high"], "block_bottom": c[ob]["low"], "poi": "OB",
                     "trigger": f"{scope} {'MSS' if e['kind'] == 'MSS' else 'BOS'}", "scope": scope,
                     "break_level": c[e["level_index"]]["low"] if d == -1 else c[e["level_index"]]["high"],
-                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push, "swept": swept, "fast": fast,
+                    "break_time": c[t]["time"], "idm": idm, "idm_taken": taken, "pools": len(pools), "typical": typical, "push": push, "swept": swept, "fast": fast, "hunted": len(hunted), "equal": equal,
                     "fvg_time": c[gap - 1]["time"], "fvg_bottom": fvg[0], "fvg_top": fvg[1],
                     "with_trend": htf["trend"] == d, "htf_poi": tapped,
-                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15 and swept}
+                    "aplus": htf["trend"] == d and push >= typical * 3 and rr <= 15 and bool(hunted)}
         if best:
             out.append(best)
     return out
@@ -365,6 +421,7 @@ def grade(setup):
 
 
 LAST_SEND = [0.0]
+INSIDE = {}                                                 # lower-timeframe candles of blocks already looked into
 
 
 def whatabot(path, body):
@@ -499,7 +556,8 @@ def picture(candles, setup, symbol, timeframe):
         draw.text((right + 4, y(price) - 7), f"{name} {price_text(price, symbol)}", fill=(255, 255, 255), font=small)
     label = "A+" if setup["aplus"] else "A" if setup["with_trend"] else "counter-trend"
     draw.text((left + 2, 10), f"{symbol}  {timeframe}  ·  {'Long' if setup['direction'] == 1 else 'Short'}  ·  {label}  ·  {setup['rr']:.1f}R", fill=(214, 218, 225), font=big)
-    notes = [setup.get("trigger", "")] + (["swept liquidity"] if setup.get("swept") else []) + (["CONFIRMED"] if setup.get("confirmed") else [])
+    notes = ([setup.get("trigger", "")] + (["1h liquidity hunted"] if setup.get("hunted") else ["swept liquidity"] if setup.get("swept") else [])
+             + ([f"entry on the {setup['entry_tf']} block"] if setup.get("entry_tf") else []) + (["CONFIRMED"] if setup.get("confirmed") else []))
     draw.text((left + 2, 36), "  ·  ".join([n for n in notes if n] + ["a pattern, not a prediction"]), fill=(125, 133, 144), font=small)
     data = io.BytesIO()
     image.save(data, format="JPEG", quality=85)
@@ -583,6 +641,18 @@ def main():
                     notify(text, picture(closed, dict(p, confirmed=True), symbol, timeframe) if config.get("send_picture", True) else None, "confirmed")
             # the stricter method decides what can be A+; the earlier rules still stand, graded A at most
             found = find_setups_v2(closed[-800:], config.get("min_rr", 3.5), seconds, history=closed)
+            for n, s in enumerate(found):
+                low_tf = LOWER.get(seconds)
+                span = (s["time"], s["time"] + seconds)                 # the candles that make up the block
+                if low_tf and s["block_top"] - s["block_bottom"] > s["typical"] * 1.2:
+                    if (name, low_tf) + span not in INSIDE:
+                        try:
+                            INSIDE[(name, low_tf) + span] = fetch_range(name, low_tf, span[0], span[1], token)
+                        except Exception:
+                            INSIDE[(name, low_tf) + span] = []
+                    s = found[n] = refine_entry(s, INSIDE[(name, low_tf) + span], closed)
+                s["entry_tf"] = {60: "1m", 300: "5m", 600: "10m", 900: "15m", 3600: "1h"}.get(low_tf, timeframe) if s.get("refined") else timeframe
+            found = [s for s in found if s["rr"] >= config.get("min_rr", 3.5)]
             for old in find_setups(closed[-800:], config.get("min_rr", 3.5), trend):
                 if not any(new["direction"] == old["direction"] for new in found):
                     old["aplus"] = False
@@ -612,7 +682,8 @@ def main():
                 for tag, place in events:
                     if base + "|" + tag in sent:
                         continue
-                    tags = [s["trigger"]] + (["swept liquidity"] if s.get("swept") else []) if "trigger" in s else []
+                    tags = ([s["trigger"]] + (["1h equal levels hunted" if s.get("equal") else "1h liquidity hunted"] if s.get("hunted") else
+                                             ["swept liquidity"] if s.get("swept") else []) + [f"entry on the {s['entry_tf']} block"]) if "trigger" in s else []
                     how = f" [{', '.join(tags)}]" if tags else ""
                     text = (f"{grade(s)}: {symbol} {timeframe} {side}{how}, {place}. Entry {price_text(s['entry'], symbol)}, "
                             f"stop {price_text(s['stop'], symbol)}, target {price_text(s['target'], symbol)} ({s['rr']:.1f}R).")
